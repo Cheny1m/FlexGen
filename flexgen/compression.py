@@ -7,6 +7,17 @@ from flexgen.pytorch_backend import (TorchTensor, TorchDevice,
     DeviceType, general_copy, fix_recursive_import)
 from flexgen.utils import np_dtype_to_torch_dtype
 
+import time
+from contextlib import contextmanager
+@contextmanager
+def timed_block(label):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        end = time.perf_counter()
+        print(f"{label} : {end - start:.6f}秒")
+
 
 @dataclasses.dataclass
 class CompressionConfig:
@@ -118,6 +129,7 @@ class TorchCompressedDevice:
         data = data - mn
         data.mul_(scale)
         data = data.clamp_(0, B).round_().to(torch.uint8)
+        print("compressTo4bit:",data)
 
         # Pack
         left_indices = (
@@ -142,6 +154,50 @@ class TorchCompressedDevice:
 
         return TorchTensor(shape, tensor.dtype,
                            (data, scale, comp_config), self)
+
+    def unpack_data(self, tensor):
+        # # 扩展数据形状以分离打包的值
+        data, scale, comp_config = tensor.data
+        group_size, num_bits, group_dim, symmetric = (
+            comp_config.group_size, comp_config.num_bits,
+            comp_config.group_dim, comp_config.symmetric)
+
+        group_size_c = group_size // 2
+        shape = data.shape
+        num_groups = (shape[group_dim] + group_size_c - 1) // group_size_c
+
+        # Pad
+        new_shape = (shape[:group_dim] + (num_groups, group_size_c) +
+                     shape[group_dim+1:])
+        pad_len = (group_size_c - shape[group_dim] % group_size_c) % group_size_c
+        if pad_len != 0:
+            pad_shape = shape[:group_dim] + (pad_len,) + shape[group_dim+1:]
+            data = torch.cat([
+                data,
+                torch.zeros(pad_shape, dtype=data.dtype, device=data.device)],
+                dim=group_dim)
+        packed = data.data.view(new_shape)
+
+        # Unpack
+        if self.base_device.device_type == DeviceType.CPU:
+            self.workspace_pt = (self.workspace_pt + 1) % len(
+                self.data_decompress_workspace)
+            data = self.data_decompress_workspace[
+                self.workspace_pt][:shape[0]]
+        else:
+            new_shape = (shape[:group_dim] + (num_groups, group_size,) +
+                         shape[group_dim+1:])
+            data = torch.empty(new_shape, dtype=torch.uint8, device=packed.device)
+        left_indices = (
+            tuple(slice(0, x) for x in data.shape[:group_dim+1]) +
+            (slice(0, data.shape[group_dim+1], 2),))
+        right_indices = (
+            tuple(slice(0, x) for x in data.shape[:group_dim+1]) +
+            (slice(1, data.shape[group_dim+1], 2),))
+        data[left_indices] = packed.bitwise_right_shift(4)
+        data[right_indices] = packed.bitwise_and(0xF)
+        return data
+                       
 
     def decompress(self, tensor):
         data, scale, comp_config = tensor.data
@@ -352,9 +408,13 @@ def test_real_compression():
         num_bits=4, group_size=32, group_dim=0, symmetric=False)
     dev = TorchDevice("cuda:0", 0, 0).compressed_device
     packed = dev.compress(a, config)
-    b = dev.decompress(packed)
+    with timed_block("unpack_data"):
+        b1 = dev.unpack_data(packed)
+    with timed_block("decompress"):
+        b = dev.decompress(packed)
 
     print(a.flatten())
+    print("unit8To4bit",b1)
     print(b.flatten())
 
 
